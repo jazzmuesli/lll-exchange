@@ -16,7 +16,7 @@ best-practice measurement.
 ```bash
 cd /home/preich/hgit/lowlat
 source tools/env.sh          # puts local Java 27 + Maven on PATH
-mvn -B test                  # build + run the 31 acceptance tests
+mvn -B test                  # build + run the 35 acceptance tests
 mvn -B package               # build the shaded, runnable jar
 tools/run.sh demo            # watch a realistic session: the trade TAPE + BOOK, live
 ```
@@ -166,14 +166,21 @@ rejection of a non-journal file.
 
 | scenario | throughput | p50 | notes |
 |---|---|---|---|
-| `rest`  (insert-heavy) | ~16.6 M ops/s | 36 ns | build depth |
-| `cross` (match-heavy)  | ~11.9 M ops/s | 59 ns | IOC crossing |
-| `mixed` (50/50)        | ~8.6 M ops/s  | 82 ns | |
+| `rest`  (insert-heavy) | ~17.6 M ops/s | 28 ns | build depth |
+| `cross` (match-heavy)  | ~13.6 M ops/s | 46 ns | IOC crossing |
+| `mixed` (50/50)        | ~9.0 M ops/s  | 74 ns | |
+
+> These are after the two quick wins below (allocation-free reactor; multiply-shift price→tick).
+> Before them the same benchmark read 16.6 M / 36 ns (`rest`), 11.9 M / 59 ns (`cross`),
+> 8.6 M / 82 ns (`mixed`). Treat the deltas as indicative — the host is shared — except for the
+> isolated mapping A/B, which is a controlled same-process comparison.
 
 ### End-to-end over TCP
 
 * True round-trip latency, **inflight = 1** (no client pipelining): **p50 ≈ 19 µs**, p90 ≈ 30 µs,
   p99 ≈ 97 µs. Dominated by syscalls + thread hand-off, not the matcher (whose p50 is tens of ns).
+  Re-measured after the two quick wins below: **p50 ≈ 16 µs, p90 ≈ 21 µs, p99 ≈ 31 µs** (the tail is
+  very host-load sensitive).
 * At **inflight = 16** (low, but allows a little pipelining): p50 ≈ 33 µs.
 * Throughput: sustained ~**200k orders/s** at target; peak engine-side ~**500k orders/s** with
   8 connections / inflight 2048 (FastWire codec).
@@ -181,11 +188,43 @@ rejection of a non-journal file.
 > Latency must be measured with **low** inflight (1–16). High inflight (≥256) inflates numbers
 > with client-side pipelining delay and is only valid for *throughput*.
 
-### GC comparison (engine, steady state)
+### GC — measured (engine process under load, ~450k orders/s)
 
-G1 vs `-XX:+UseZGC -Xmx4g` vs Epsilon (`-XX:+UnlockExperimentalVMOptions -XX:+UseEpsilonGC
--Xmx3g`). Epsilon ran clean at steady state, showing the engine is **nearly allocation-free** on
-the hot path. GC choice did not move the p50; only the tail.
+Method: start the engine with `-Xlog:gc:<file>`, drive it with the load generator, then split the
+GC log by timestamp (start-up vs. steady state).
+
+| collector | GC pauses during the load | longest pause | notes |
+|---|---|---|---|
+| G1 (default) | all 8 sit in a ~60 ms window at load onset (t≈3.44–3.49 s), then **zero** | 8.5 ms | **humongous** allocs: `OrderStore` + per-product ladders |
+| ZGC (`-XX:+UseZGC -Xmx4g`) | **0** | — | concurrent; no stop-the-world |
+| Epsilon (`-XX:+UseEpsilonGC -Xms2g -Xmx2g`) | **never collects** | — | 6.7 M orders / 20 s; used heap was 133→141 MB, **now flat at 132 MB** (alloc fix below) |
+
+Takeaways:
+
+* **The matching kernel allocates nothing on its hot path.** The 20 M-op `bench` GC log has no line
+  after the benchmark's explicit `System.gc()`.
+* In the whole engine process the only GC work is **start-up**: the struct-of-arrays `OrderStore`
+  (~64 MB) and each traded product's price ladder (~3.5 MB/product) are single humongous
+  allocations that G1 reclaims in a handful of young pauses. After load onset the log is silent.
+* Epsilon survives the whole run. **After the reactor fix (see below) the engine's used heap is
+  dead flat** — 132 MB across 3.3 M orders under load, versus 133→141 MB before — so the only
+  steady-state allocation (the reactor's per-`select()` `Iterator`) is now gone, not merely small.
+
+Conclusion: **GC is already off the critical path.** Collector choice does not move p50 (36–82 ns
+kernel); it only bounds the tail. Use a low-pause collector (ZGC) plus pinning for bare-metal tails;
+the remaining latency is syscall/thread-hand-off, not the collector.
+
+### Optimisation log
+
+Two quick wins from the backlog, each measured:
+
+* **Allocation-free reactor** — `SelectedSelectionKeySet` replaces the JDK selector's ready-key set
+  (Netty-style reflection on `sun.nio.ch.SelectorImpl`, with an automatic fallback), and the loop
+  iterates the backing array by index. Engine used heap under sustained load went from growing
+  (~0.5 MB/s) to **flat at 132 MB**, so even an Epsilon run no longer accumulates garbage.
+* **Exact multiply-shift price→tick** — `EngineConfig` precomputes the divide in its constructor.
+  Isolated same-process A/B: **1.8 ns vs 4.2 ns** per mapping (~57% cheaper, no `idiv`). Kernel
+  `bench` p50 moved `rest` 36→28 ns, `cross` 59→46 ns, `mixed` 82→74 ns (indicative; shared host).
 
 ### Environment caveat
 
@@ -250,7 +289,7 @@ the wire, so a **market-data subscriber can literally see the matched price**.
 * `MatchingEngine` gained top-of-book accessors (`bestBidPrice/Qty`, `bestAskPrice/Qty`) used by the
   tests and the demo.
 
-### New tests (7), all green — 31 total
+### Tests — 35 total, all green
 
 | test | what it proves |
 |---|---|
@@ -258,6 +297,8 @@ the wire, so a **market-data subscriber can literally see the matched price**.
 | `DifferentialMarketTest` (3) | the optimised engine matches a **naive textbook reference** exactly, trade-for-trade and on the final book, over **60k randomized orders** (wide/tight/choppy books) |
 | `MarketScenarioTest` (2) | a whole mini-session: prints at the resting price, cancels, book never crossed, trade ids monotonic, quantity conserved |
 | `MarketDataIntegrationTest` (2) | over real TCP: a **passive subscriber** sees the book and the tape print at the matched price; a market sweep prints a rising ladder of prices |
+| `EngineConfigTest` (3) | the multiply-shift price→tick map equals the naive div/mod reference everywhere, across tick sizes and the division fallback |
+| `FastSelectorTest` (1) | the gateway installs the allocation-free ready-key set (fast-path is live, not silently falling back) |
 | `FastWireRoundTripTest` (6) | protobuf-java byte compatibility |
 | `GatewayIntegrationTest` (3) | end-to-end order → ack → fill over sockets |
 | `TradeJournalTest` (4) | journal write/replay/growth/reopen |
@@ -323,7 +364,7 @@ Being fast and being readable are not in conflict here, so the code follows a fe
 ```bash
 cd /home/preich/hgit/lowlat
 source tools/env.sh
-mvn -B test          # 31 acceptance tests: engine 11 + 2 + 3, wire 6, gateway 3 + 2, journal 4
+mvn -B test          # 35 tests: engine 19 (11+2+3+3 config), wire 6, gateway 6 (3+2+1), journal 4
 mvn -B package       # shaded runnable jar at target/lowlat-exchange.jar
 
 tools/run.sh bench --ops 20000000 --scenario mixed
@@ -332,6 +373,47 @@ tools/run.sh engine --port 9001 --journal /tmp/opencode/journal &
 tools/run.sh loadgen --port 9001 --conns 4 --rate 200000 --duration 10000 --inflight 16
 tools/run.sh journal-dump /tmp/opencode/journal
 ```
+
+## Optimisation backlog (low latency)
+
+Ranked by expected effect on p99.9 on this shared, unpinned host. Items marked **[done]** are already
+in the code; the rest are candidates.
+
+**A. Application / JVM (cheap, high ROI)**
+
+1. **[done] Kill the last hot-path allocation.** The reactor used to call
+   `selector.selectedKeys().iterator()` on every non-empty `selectNow()`. `SelectedSelectionKeySet`
+   now replaces the JDK selector's ready-key sets (the Netty-style reflection on
+   `sun.nio.ch.SelectorImpl`) and the loop iterates the backing array by index — zero allocation,
+   with an automatic fallback to the standard iterator if the install ever fails. Effect: the
+   engine's used heap is now **flat (132 MB)** under sustained load where it previously grew ~0.5 MB/s.
+2. **[done] `EngineConfig.tickFor` price→tick.** `EngineConfig` (now a final class, so it can cache
+   precomputed state) builds an **exact** multiply-shift divide in its constructor and confirms
+   divisibility with one multiply — no `idiv` per order. Isolated same-process A/B: **1.8 ns vs
+   4.2 ns** per mapping (~57% cheaper); the `rest` kernel scenario moved p50 36→28 ns.
+3. **Per-product book memory.** Each `OrderBook` eagerly allocates 4×`int[110 001]` + 2×`long[110
+   001]` ≈ **3.5 MB/product** on first use (×1024 products ≈ 3.6 GB, plus humongous GC churn). Use a
+   bounded/sparse window per product, or narrower types, to cut TLB/cache pressure and start-up GC.
+4. **One fewer copy in `RingSink`.** It stages into a scratch `byte[128]` and `write()` copies it
+   into the ring; Agrona `tryClaim`/`commit` would encode straight into the ring.
+5. **JVM flags for the tail:** `-Xms=-Xmx`, `-XX:+AlwaysPreTouch`, `-XX:+UseTransparentHugePages`,
+   `-XX:+UseNUMA`, and a low-pause collector (ZGC) or Parallel for throughput.
+6. **CPU isolation:** `isolcpus`/`nohz_full` + `taskset`, NIC IRQ affinity (`irqbalance` off),
+   `SO_BUSY_POLL`. Needs root/hardware.
+7. **Matcher micro-opts:** `@Contended` padding on ring cursors, replace bounds checks with
+   `Unsafe`/`VarHandle` access, software prefetch (`Unsafe.prefetchRead`) of the next book level,
+   and fewer branches in the sweep loop.
+
+**B. Transport (largest absolute win)**
+
+8. **Native epoll / `io_uring`** instead of NIO (Netty `EpollEventLoop`, or Agrona/Aeron) — removes
+   `Selector` overhead and enables multicast UDP market-data fan-out.
+9. **Kernel-bypass** (`ef_vi`/OpenOnload, DPDK) for wire-to-wire sub-µs; out of scope on this host.
+
+**C. Measurement correctness**
+
+10. Port the kernel benchmark to **JMH** (JIT/DCE-safe) and add **coordinated-omission** correction
+    to the HdrHistogram reports; keep k6 as a secondary smoke test.
 
 ## Known issues / limitations
 

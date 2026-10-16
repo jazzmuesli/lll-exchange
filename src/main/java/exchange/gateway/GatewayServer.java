@@ -3,6 +3,7 @@ package exchange.gateway;
 import exchange.wire.FastWire;
 import exchange.wire.MsgType;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
@@ -51,6 +52,12 @@ public final class GatewayServer implements AutoCloseable {
     private int nextSessionId = 1;
     private long droppedOutbound;
 
+    /**
+     * Allocation-free ready-key set, installed over the JDK selector's own sets in {@link #start()}.
+     * {@code null} means the install was not possible and the loop uses the standard iterator.
+     */
+    private SelectedSelectionKeySet fastSelectedKeys;
+
     public GatewayServer(int port, ManyToOneRingBuffer inbound, OneToOneRingBuffer outbound) {
         this.port = port;
         this.inbound = inbound;
@@ -79,6 +86,7 @@ public final class GatewayServer implements AutoCloseable {
 
     public void start() throws IOException {
         selector = Selector.open();
+        installFastSelectedKeys();
         server = ServerSocketChannel.open();
         server.configureBlocking(false);
         server.setOption(StandardSocketOptions.SO_REUSEADDR, true);
@@ -102,36 +110,87 @@ public final class GatewayServer implements AutoCloseable {
                 continue;
             }
             if (ready > 0) {
-                final Iterator<SelectionKey> it = selector.selectedKeys().iterator();
-                while (it.hasNext()) {
-                    final SelectionKey key = it.next();
-                    it.remove();
-                    try {
-                        if (!key.isValid()) {
-                            continue;
-                        }
-                        if (key.isAcceptable()) {
-                            accept();
-                        } else {
-                            final Session session = (Session) key.attachment();
-                            if (key.isReadable()) {
-                                read(session);
-                            }
-                            if (key.isValid() && key.isWritable()) {
-                                flush(session);
-                            }
-                        }
-                    } catch (IOException e) {
-                        final Object a = key.attachment();
-                        if (a instanceof Session session) {
-                            closeSession(session);
-                        }
+                final SelectedSelectionKeySet fast = fastSelectedKeys;
+                if (fast != null) {
+                    // Allocation-free path: snapshot the array + count, clear the set, dispatch by
+                    // index. Clearing up front means keys cancelled during dispatch (channel close)
+                    // are skipped by the isValid() check below; the array is reused every cycle.
+                    final SelectionKey[] keys = fast.keys;
+                    final int count = fast.size;
+                    fast.size = 0;
+                    for (int i = 0; i < count; i++) {
+                        handleKey(keys[i]);
+                    }
+                } else {
+                    final Iterator<SelectionKey> it = selector.selectedKeys().iterator();
+                    while (it.hasNext()) {
+                        final SelectionKey key = it.next();
+                        it.remove();
+                        handleKey(key);
                     }
                 }
             }
             drainOutbound();
             flushDirty();
             Thread.onSpinWait();
+        }
+    }
+
+    /**
+     * Replace the JDK selector's ready-key sets with our allocation-free {@link
+     * SelectedSelectionKeySet} so the reactor loop does not allocate an iterator per select.
+     *
+     * <p>Reflection on {@code sun.nio.ch.SelectorImpl} (needs {@code --add-opens
+     * java.base/sun.nio.ch=ALL-UNNAMED}, which {@code tools/run.sh} and Maven surefire both pass).
+     * Any failure — non-OpenJDK selector, missing module open — is swallowed and the loop falls back
+     * to the standard iterator, so this is strictly an optimisation, never a correctness risk.
+     */
+    private void installFastSelectedKeys() {
+        try {
+            final Class<?> selectorImplClass = Class.forName("sun.nio.ch.SelectorImpl");
+            if (!selectorImplClass.isInstance(selector)) {
+                return;
+            }
+            final SelectedSelectionKeySet fast = new SelectedSelectionKeySet();
+            final Field selectedKeys = selectorImplClass.getDeclaredField("selectedKeys");
+            final Field publicSelectedKeys = selectorImplClass.getDeclaredField("publicSelectedKeys");
+            selectedKeys.setAccessible(true);
+            publicSelectedKeys.setAccessible(true);
+            selectedKeys.set(selector, fast);
+            publicSelectedKeys.set(selector, fast);
+            fastSelectedKeys = fast;
+        } catch (Throwable t) {
+            fastSelectedKeys = null;
+        }
+    }
+
+    /** True when the allocation-free ready-key set is in use (i.e. the install succeeded). */
+    boolean usingFastSelector() {
+        return fastSelectedKeys != null;
+    }
+
+    /** Handle one ready key; shared by the fast and fallback loops. */
+    private void handleKey(SelectionKey key) {
+        try {
+            if (!key.isValid()) {
+                return;
+            }
+            if (key.isAcceptable()) {
+                accept();
+            } else {
+                final Session session = (Session) key.attachment();
+                if (key.isReadable()) {
+                    read(session);
+                }
+                if (key.isValid() && key.isWritable()) {
+                    flush(session);
+                }
+            }
+        } catch (IOException e) {
+            final Object attachment = key.attachment();
+            if (attachment instanceof Session session) {
+                closeSession(session);
+            }
         }
     }
 
