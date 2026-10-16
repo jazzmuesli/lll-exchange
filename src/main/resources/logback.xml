@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Logging configuration for the exchange.
+
+  Design notes (low-latency):
+    * The matching hot path never logs. Logging is confined to startup/shutdown, periodic
+      stats and the load generator/benchmark reporting utilities.
+    * Each appender is wrapped in its own AsyncAppender (a bounded queue drained by a dedicated
+      thread) so a slow or blocked console/file never stalls the calling thread. (logback's
+      AsyncAppender accepts exactly one child appender, hence one wrapper per destination.)
+      neverBlock=true means a full queue drops events instead of applying back-pressure.
+    * NopStatusListener keeps logback's own configuration chatter off stdout.
+    * Levels and destinations are overridable without editing this file:
+        -Dlowlat.log.level=DEBUG                 (root level)
+        -Dlowlat.log.dir=/var/log/lowlat         (rolling file directory)
+        -Dlogback.configurationFile=/path/to.xml (replace this config entirely)
+
+  Tests use a separate, synchronous console-only config (src/test/resources/logback-test.xml).
+-->
+<configuration>
+  <statusListener class="ch.qos.logback.core.status.NopStatusListener"/>
+
+  <property name="LOG_PATTERN"
+            value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{28} - %msg%n"/>
+  <property name="LOG_LEVEL" value="${lowlat.log.level:-INFO}"/>
+  <property name="LOG_DIR" value="${lowlat.log.dir:-logs}"/>
+
+  <!-- Human-readable console -->
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>${LOG_PATTERN}</pattern>
+    </encoder>
+  </appender>
+
+  <!-- Durable, size-and-time-rotated file log -->
+  <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <file>${LOG_DIR}/lowlat.log</file>
+    <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+      <fileNamePattern>${LOG_DIR}/lowlat.%d{yyyy-MM-dd}.%i.log.gz</fileNamePattern>
+      <maxFileSize>50MB</maxFileSize>
+      <maxHistory>7</maxHistory>
+      <totalSizeCap>1GB</totalSizeCap>
+    </rollingPolicy>
+    <encoder>
+      <pattern>${LOG_PATTERN}</pattern>
+    </encoder>
+  </appender>
+
+  <!-- Hand each appender off to a bounded async queue: the caller never blocks on I/O. -->
+  <appender name="ASYNC_CONSOLE" class="ch.qos.logback.classic.AsyncAppender">
+    <queueSize>8192</queueSize>
+    <discardingThreshold>0</discardingThreshold>
+    <neverBlock>true</neverBlock>
+    <includeCallerData>false</includeCallerData>
+    <appender-ref ref="CONSOLE"/>
+  </appender>
+
+  <appender name="ASYNC_FILE" class="ch.qos.logback.classic.AsyncAppender">
+    <queueSize>8192</queueSize>
+    <discardingThreshold>0</discardingThreshold>
+    <neverBlock>true</neverBlock>
+    <includeCallerData>false</includeCallerData>
+    <appender-ref ref="FILE"/>
+  </appender>
+
+  <!-- Stifle third-party chatter; raise per-package levels here if you need to debug them. -->
+  <logger name="net.openhft" level="WARN"/>
+  <logger name="org.agrona" level="WARN"/>
+  <logger name="io.netty" level="WARN"/>
+
+  <root level="${LOG_LEVEL}">
+    <appender-ref ref="ASYNC_CONSOLE"/>
+    <appender-ref ref="ASYNC_FILE"/>
+  </root>
+</configuration>

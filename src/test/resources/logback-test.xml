@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Test-time logging: console only, no async queue, no file, no rotation.
+  This keeps `mvn test` output deterministic and keeps the async appender's
+  discarding behaviour from hiding assertions in tests that inspect logs.
+  Override with -Dlogback.configurationFile=... if a test needs the real config.
+-->
+<configuration>
+  <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{24} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <logger name="net.openhft" level="WARN"/>
+  <logger name="org.agrona" level="WARN"/>
+
+  <root level="${lowlat.log.level:-INFO}">
+    <appender-ref ref="CONSOLE"/>
+  </root>
+</configuration>

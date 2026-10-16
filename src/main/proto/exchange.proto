@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package exchange.v1;
+
+option java_package = "exchange.proto";
+option java_outer_classname = "ExchangeWire";
+option java_multiple_files = false;
+
+// ---------------------------------------------------------------------------
+// Enumerations
+// ---------------------------------------------------------------------------
+
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  BUY = 1;   // consumer of electricity (or a long position)
+  SELL = 2;  // producer of electricity (or a short position)
+}
+
+enum OrdType {
+  ORD_UNSPECIFIED = 0;
+  LIMIT = 1;   // price-limited
+  MARKET = 2;  // unlimited, bounded by the market-order matching range
+}
+
+enum TimeInForce {
+  TIF_UNSPECIFIED = 0;
+  GTC = 1;  // good till cancel: remainder rests in the book
+  IOC = 2;  // immediate or cancel: fill what you can now, cancel the rest
+  FOK = 3;  // fill or kill: all-or-nothing, immediately
+}
+
+message NewOrder {
+  uint64 client_order_id = 1;  // caller-assigned, unique per session
+  int32  product_id      = 2;  // contract id (delivery period + area + duration)
+  Side   side            = 3;
+  OrdType type           = 4;
+  TimeInForce tif        = 5;
+  int64  price           = 6;  // fixed-point; scale in PRICE_SCALE (see README)
+  int64  quantity        = 7;  // fixed-point MW; scale in QTY_SCALE
+}
+
+message CancelOrder {
+  uint64 client_order_id = 1;
+  int32  product_id      = 2;
+  uint64 exchange_order_id = 3;  // if known; else 0 and match by client id
+}
+
+// ---------------------------------------------------------------------------
+// Client -> exchange
+// ---------------------------------------------------------------------------
+
+message ClientMessage {
+  oneof msg {
+    NewOrder    new_order = 1;
+    CancelOrder cancel    = 2;
+    Heartbeat   heartbeat = 3;
+  }
+}
+
+message Heartbeat {
+  uint64 client_nonce = 1;
+  int64  send_time_ns = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Exchange -> client
+// ---------------------------------------------------------------------------
+
+enum OrdStatus {
+  ORD_STATUS_UNSPECIFIED = 0;
+  ACCEPTED  = 1;
+  REJECTED  = 2;
+  PARTIAL   = 3;
+  FILLED    = 4;
+  CANCELLED = 5;
+  EXPIRED   = 6;
+}
+
+message OrderAck {
+  uint64 client_order_id   = 1;
+  uint64 exchange_order_id = 2;
+  bool   accepted          = 3;
+  string reason            = 4;
+  int64  recv_time_ns      = 5;  // exchange receive timestamp (TSC/nanoTime)
+}
+
+message Fill {
+  uint64 trade_id          = 1;
+  uint64 exchange_order_id = 2;  // the aggressor's order id
+  uint64 maker_order_id    = 3;
+  int64  price             = 4;
+  int64  quantity          = 5;
+  int64  ts_ns             = 6;
+}
+
+message ExecutionReport {
+  uint64 client_order_id   = 1;
+  uint64 exchange_order_id = 2;
+  int32  product_id        = 3;
+  OrdStatus status         = 4;
+  int64  leaves_quantity   = 5;
+  int64  filled_quantity   = 6;
+  repeated Fill fills      = 7;
+  int64  ts_ns             = 8;
+}
+
+// A public trade print (market data / tape).
+message Trade {
+  uint64 trade_id       = 1;
+  int32  product_id     = 2;
+  int64  price          = 3;
+  int64  quantity       = 4;
+  Side   aggressor_side = 5;
+  int64  ts_ns          = 6;
+}
+
+// Top-of-book snapshot for a product.
+message BookUpdate {
+  int32 product_id   = 1;
+  int64 bid_price    = 2;
+  int64 bid_quantity = 3;
+  int64 ask_price    = 4;
+  int64 ask_quantity = 5;
+  int64 ts_ns        = 6;
+}
+
+message ServerMessage {
+  oneof msg {
+    OrderAck        ack     = 1;
+    ExecutionReport exec    = 2;
+    Trade           trade   = 3;
+    BookUpdate      book    = 4;
+    Heartbeat       heartbeat = 5;
+  }
+}
