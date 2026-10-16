@@ -20,7 +20,7 @@ public final class Launcher {
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0) {
-            LOG.error("usage: <engine|loadgen|bench|journal-dump> [options]");
+            LOG.error("usage: <engine|loadgen|bench|demo|journal-dump> [options]");
             System.exit(2);
         }
         final String role = args[0];
@@ -29,6 +29,7 @@ public final class Launcher {
             case "engine" -> exchange.engine.EngineMain.main(rest);
             case "loadgen" -> exchange.loadgen.LoadGen.main(rest);
             case "bench" -> exchange.bench.MatchingBenchmark.main(rest);
+            case "demo" -> exchange.demo.MarketDemo.main(rest);
             case "journal-dump" -> exchange.journal.JournalDump.main(rest);
             default -> {
                 LOG.error("unknown role: {}", role);

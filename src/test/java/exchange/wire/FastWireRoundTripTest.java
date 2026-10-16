@@ -17,9 +17,9 @@ import org.junit.jupiter.api.Test;
  */
 class FastWireRoundTripTest {
 
-    private static byte[] bytes(ByteBuffer b) {
-        final byte[] out = new byte[b.remaining()];
-        b.get(out);
+    private static byte[] bytes(ByteBuffer buf) {
+        final byte[] out = new byte[buf.remaining()];
+        buf.get(out);
         return out;
     }
 

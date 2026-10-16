@@ -31,6 +31,7 @@ public final class FastWire {
     public static final int KIND_NONE = 0;
     public static final int KIND_ACK = 1;
     public static final int KIND_EXEC = 2;
+    public static final int KIND_TRADE = 3;
     public static final int KIND_BOOK = 4;
     public static final int KIND_HEARTBEAT = 5;
 
@@ -42,54 +43,65 @@ public final class FastWire {
 
     // ------------------------------------------------------------------ varint
 
-    public static void writeVarint(ByteBuffer b, long v) {
-        while ((v & ~0x7FL) != 0) {
-            b.put((byte) ((v & 0x7F) | 0x80));
-            v >>>= 7;
+    // Protobuf's variable-length integer ("varint"): 7 payload bits per byte, low group first, with
+    // the top bit set on every byte except the last. We hand-roll it so encoding never touches the
+    // protobuf-java runtime (see class doc). Field tags are just a varint of (fieldNumber << 3)|type.
+
+    /** Write {@code value} as a protobuf varint (32- or 64-bit; the wire format is the same). */
+    public static void writeVarint(ByteBuffer buf, long value) {
+        while ((value & ~0x7FL) != 0) {
+            buf.put((byte) ((value & 0x7F) | 0x80));
+            value >>>= 7;
         }
-        b.put((byte) v);
+        buf.put((byte) value);
     }
 
-    public static long readVarint(ByteBuffer b) {
-        long v = 0;
-        int s = 0;
+    /** Read one protobuf varint from {@code buf}'s current position. */
+    public static long readVarint(ByteBuffer buf) {
+        long value = 0;
+        int shift = 0;
         while (true) {
-            final byte c = b.get();
-            v |= (long) (c & 0x7F) << s;
-            if ((c & 0x80) == 0) {
-                return v;
+            final byte currentByte = buf.get();
+            value |= (long) (currentByte & 0x7F) << shift;
+            if ((currentByte & 0x80) == 0) {
+                return value;
             }
-            s += 7;
-            if (s > 63) {
+            shift += 7;
+            if (shift > 63) {
                 throw new IllegalArgumentException("varint too long");
             }
         }
     }
 
-    private static void tag(ByteBuffer b, int field, int wt) {
-        writeVarint(b, ((long) field << 3) | wt);
+    /** Write a field tag: {@code (fieldNumber << 3) | wireType}. */
+    private static void tag(ByteBuffer buf, int fieldNumber, int wireType) {
+        writeVarint(buf, ((long) fieldNumber << 3) | wireType);
     }
 
-    private static void int64(ByteBuffer b, int field, long v) {
-        tag(b, field, WT_VARINT);
-        writeVarint(b, v);
+    /** Write a 64-bit field (varint-encoded; protobuf uses the compact form for small values). */
+    private static void int64(ByteBuffer buf, int fieldNumber, long value) {
+        tag(buf, fieldNumber, WT_VARINT);
+        writeVarint(buf, value);
     }
 
-    private static void int32(ByteBuffer b, int field, int v) {
-        tag(b, field, WT_VARINT);
-        writeVarint(b, v);
+    /** Write a 32-bit field (varint-encoded; width is not distinguishable on the wire). */
+    private static void int32(ByteBuffer buf, int fieldNumber, int value) {
+        tag(buf, fieldNumber, WT_VARINT);
+        writeVarint(buf, value);
     }
 
-    private static void bool(ByteBuffer b, int field, boolean v) {
-        tag(b, field, WT_VARINT);
-        b.put((byte) (v ? 1 : 0));
+    /** Write a {@code bool} field (protobuf encodes it as a 1-byte varint). */
+    private static void bool(ByteBuffer buf, int fieldNumber, boolean value) {
+        tag(buf, fieldNumber, WT_VARINT);
+        buf.put((byte) (value ? 1 : 0));
     }
 
-    private static void string(ByteBuffer b, int field, String s) {
-        final byte[] u = s.getBytes(StandardCharsets.UTF_8);
-        tag(b, field, WT_LEN);
-        writeVarint(b, u.length);
-        b.put(u);
+    /** Write a length-delimited UTF-8 string field. */
+    private static void string(ByteBuffer buf, int fieldNumber, String value) {
+        final byte[] utf8 = value.getBytes(StandardCharsets.UTF_8);
+        tag(buf, fieldNumber, WT_LEN);
+        writeVarint(buf, utf8.length);
+        buf.put(utf8);
     }
 
     // ------------------------------------------------------------- encoders
@@ -209,6 +221,20 @@ public final class FastWire {
             nested.flip();
             return wrap(nested, 4);
         }
+
+        /** Encode {@code ServerMessage{ trade = Trade{...} }} (the public tape print). */
+        public ByteBuffer trade(long tradeId, int productId, long price, long qty, int aggressorSide,
+                                long ts) {
+            nested.clear();
+            int64(nested, 1, tradeId);
+            int32(nested, 2, productId);
+            int64(nested, 3, price);
+            int64(nested, 4, qty);
+            int32(nested, 5, aggressorSide);
+            int64(nested, 6, ts);
+            nested.flip();
+            return wrap(nested, 3);
+        }
     }
 
     // ------------------------------------------------------------- decoders
@@ -224,74 +250,79 @@ public final class FastWire {
         public long quantity;
         public long exchangeOrderId;
 
-        /** @return one of the {@code CK_*} kinds */
-        public int parse(ByteBuffer b, int off, int len) {
-            b.position(off);
-            final int end = off + len;
+        /**
+         * Parse a {@code ClientMessage} payload occupying {@code [offset, offset + length)} and
+         * return which kind it was (see {@code CK_*}). {@code length} is the message length only —
+         * the 4-byte frame prefix has already been consumed by the caller.
+         */
+        public int parse(ByteBuffer buf, int offset, int length) {
+            buf.position(offset);
+            final int end = offset + length;
             int kind = CK_NONE;
-            while (b.position() < end) {
-                final long tag = readVarint(b);
-                final int field = (int) (tag >>> 3);
-                final int wt = (int) (tag & 7);
-                if (wt == WT_LEN) {
-                    final int mlen = (int) readVarint(b);
-                    final int mstart = b.position();
-                    if (field == 1) {
+            while (buf.position() < end) {
+                final long tag = readVarint(buf);
+                final int fieldNumber = (int) (tag >>> 3);
+                final int wireType = (int) (tag & 7);
+                if (wireType == WT_LEN) {
+                    // Length-delimited field: the body is the oneof member (a nested sub-message).
+                    final int subLength = (int) readVarint(buf);
+                    final int subStart = buf.position();
+                    if (fieldNumber == 1) {
                         kind = CK_NEW_ORDER;
-                        parseNewOrder(b, mstart, mstart + mlen);
-                    } else if (field == 2) {
+                        parseNewOrder(buf, subStart, subStart + subLength);
+                    } else if (fieldNumber == 2) {
                         kind = CK_CANCEL;
-                        parseCancel(b, mstart, mstart + mlen);
-                    } else if (field == 3) {
+                        parseCancel(buf, subStart, subStart + subLength);
+                    } else if (fieldNumber == 3) {
                         kind = CK_HEARTBEAT;
                     }
-                    b.position(mstart + mlen);
+                    buf.position(subStart + subLength);
                 } else {
-                    skip(b, wt);
+                    skip(buf, wireType);
                 }
             }
             return kind;
         }
 
-        private void parseNewOrder(ByteBuffer b, int start, int end) {
-            b.position(start);
-            while (b.position() < end) {
-                final long tag = readVarint(b);
-                final int field = (int) (tag >>> 3);
-                final int wt = (int) (tag & 7);
-                if (wt != WT_VARINT) {
-                    skip(b, wt);
+        private void parseNewOrder(ByteBuffer buf, int start, int end) {
+            buf.position(start);
+            while (buf.position() < end) {
+                final long tag = readVarint(buf);
+                final int fieldNumber = (int) (tag >>> 3);
+                final int wireType = (int) (tag & 7);
+                if (wireType != WT_VARINT) {
+                    skip(buf, wireType);
                     continue;
                 }
-                final long v = readVarint(b);
-                switch (field) {
-                    case 1 -> clientOrderId = v;
-                    case 2 -> productId = (int) v;
-                    case 3 -> side = (int) v;
-                    case 4 -> type = (int) v;
-                    case 5 -> tif = (int) v;
-                    case 6 -> price = v;
-                    case 7 -> quantity = v;
+                final long value = readVarint(buf);
+                switch (fieldNumber) {
+                    case 1 -> clientOrderId = value;
+                    case 2 -> productId = (int) value;
+                    case 3 -> side = (int) value;
+                    case 4 -> type = (int) value;
+                    case 5 -> tif = (int) value;
+                    case 6 -> price = value;
+                    case 7 -> quantity = value;
                     default -> { }
                 }
             }
         }
 
-        private void parseCancel(ByteBuffer b, int start, int end) {
-            b.position(start);
-            while (b.position() < end) {
-                final long tag = readVarint(b);
-                final int field = (int) (tag >>> 3);
-                final int wt = (int) (tag & 7);
-                if (wt != WT_VARINT) {
-                    skip(b, wt);
+        private void parseCancel(ByteBuffer buf, int start, int end) {
+            buf.position(start);
+            while (buf.position() < end) {
+                final long tag = readVarint(buf);
+                final int fieldNumber = (int) (tag >>> 3);
+                final int wireType = (int) (tag & 7);
+                if (wireType != WT_VARINT) {
+                    skip(buf, wireType);
                     continue;
                 }
-                final long v = readVarint(b);
-                switch (field) {
-                    case 1 -> clientOrderId = v;
-                    case 2 -> productId = (int) v;
-                    case 3 -> exchangeOrderId = v;
+                final long value = readVarint(buf);
+                switch (fieldNumber) {
+                    case 1 -> clientOrderId = value;
+                    case 2 -> productId = (int) value;
+                    case 3 -> exchangeOrderId = value;
                     default -> { }
                 }
             }
@@ -320,153 +351,192 @@ public final class FastWire {
         public long bookAskPrice;
         public long bookAskQty;
         public long bookTs;
+        public long tradeId;
+        public long tradePrice;
+        public long tradeQty;
+        public int tradeAggressorSide;
+        public long tradeTs;
 
-        /** @return one of the {@code KIND_*} kinds */
-        public int parse(ByteBuffer b, int off, int len) {
-            b.position(off);
-            final int end = off + len;
+        /**
+         * Parse a {@code ServerMessage} payload occupying {@code [offset, offset + length)} and
+         * return which kind it was (see {@code KIND_*}). {@code length} excludes the 4-byte frame
+         * prefix.
+         */
+        public int parse(ByteBuffer buf, int offset, int length) {
+            buf.position(offset);
+            final int end = offset + length;
             int kind = KIND_NONE;
-            while (b.position() < end) {
-                final long tag = readVarint(b);
-                final int field = (int) (tag >>> 3);
-                final int wt = (int) (tag & 7);
-                if (wt == WT_LEN) {
-                    final int mlen = (int) readVarint(b);
-                    final int mstart = b.position();
-                    if (field == 1) {
+            while (buf.position() < end) {
+                final long tag = readVarint(buf);
+                final int fieldNumber = (int) (tag >>> 3);
+                final int wireType = (int) (tag & 7);
+                if (wireType == WT_LEN) {
+                    // Length-delimited field: the body is the oneof member (a nested sub-message).
+                    final int subLength = (int) readVarint(buf);
+                    final int subStart = buf.position();
+                    if (fieldNumber == 1) {
                         kind = KIND_ACK;
-                        parseAck(b, mstart, mstart + mlen);
-                    } else if (field == 2) {
+                        parseAck(buf, subStart, subStart + subLength);
+                    } else if (fieldNumber == 2) {
                         kind = KIND_EXEC;
-                        parseExec(b, mstart, mstart + mlen);
-                    } else if (field == 4) {
+                        parseExec(buf, subStart, subStart + subLength);
+                    } else if (fieldNumber == 3) {
+                        kind = KIND_TRADE;
+                        parseTrade(buf, subStart, subStart + subLength);
+                    } else if (fieldNumber == 4) {
                         kind = KIND_BOOK;
-                        parseBook(b, mstart, mstart + mlen);
-                    } else if (field == 5) {
+                        parseBook(buf, subStart, subStart + subLength);
+                    } else if (fieldNumber == 5) {
                         kind = KIND_HEARTBEAT;
                     }
-                    b.position(mstart + mlen);
+                    buf.position(subStart + subLength);
                 } else {
-                    skip(b, wt);
+                    skip(buf, wireType);
                 }
             }
             return kind;
         }
 
-        private void parseAck(ByteBuffer b, int start, int end) {
-            b.position(start);
-            while (b.position() < end) {
-                final long tag = readVarint(b);
-                final int field = (int) (tag >>> 3);
-                final int wt = (int) (tag & 7);
-                if (field == 4 && wt == WT_LEN) {
-                    final int slen = (int) readVarint(b);
-                    final byte[] u = new byte[slen];
-                    b.get(u);
-                    reason = new String(u, StandardCharsets.UTF_8);
+        private void parseAck(ByteBuffer buf, int start, int end) {
+            buf.position(start);
+            while (buf.position() < end) {
+                final long tag = readVarint(buf);
+                final int fieldNumber = (int) (tag >>> 3);
+                final int wireType = (int) (tag & 7);
+                if (fieldNumber == 4 && wireType == WT_LEN) {
+                    // Rejection reason string (only present on rejects).
+                    final int stringLength = (int) readVarint(buf);
+                    final byte[] utf8 = new byte[stringLength];
+                    buf.get(utf8);
+                    reason = new String(utf8, StandardCharsets.UTF_8);
                     continue;
                 }
-                if (wt != WT_VARINT) {
-                    skip(b, wt);
+                if (wireType != WT_VARINT) {
+                    skip(buf, wireType);
                     continue;
                 }
-                final long v = readVarint(b);
-                switch (field) {
-                    case 1 -> clientOrderId = v;
-                    case 2 -> exchangeOrderId = v;
-                    case 3 -> accepted = v != 0;
-                    case 5 -> recvNs = v;
+                final long value = readVarint(buf);
+                switch (fieldNumber) {
+                    case 1 -> clientOrderId = value;
+                    case 2 -> exchangeOrderId = value;
+                    case 3 -> accepted = value != 0;
+                    case 5 -> recvNs = value;
                     default -> { }
                 }
             }
         }
 
-        private void parseExec(ByteBuffer b, int start, int end) {
-            b.position(start);
-            while (b.position() < end) {
-                final long tag = readVarint(b);
-                final int field = (int) (tag >>> 3);
-                final int wt = (int) (tag & 7);
-                if (field == 7 && wt == WT_LEN) {
-                    final int mlen = (int) readVarint(b);
-                    final int mstart = b.position();
-                    parseFill(b, mstart, mstart + mlen);
-                    b.position(mstart + mlen);
+        private void parseExec(ByteBuffer buf, int start, int end) {
+            buf.position(start);
+            while (buf.position() < end) {
+                final long tag = readVarint(buf);
+                final int fieldNumber = (int) (tag >>> 3);
+                final int wireType = (int) (tag & 7);
+                if (fieldNumber == 7 && wireType == WT_LEN) {
+                    // Nested Fill sub-message.
+                    final int subLength = (int) readVarint(buf);
+                    final int subStart = buf.position();
+                    parseFill(buf, subStart, subStart + subLength);
+                    buf.position(subStart + subLength);
                     continue;
                 }
-                if (wt != WT_VARINT) {
-                    skip(b, wt);
+                if (wireType != WT_VARINT) {
+                    skip(buf, wireType);
                     continue;
                 }
-                final long v = readVarint(b);
-                switch (field) {
-                    case 1 -> clientOrderId = v;
-                    case 2 -> exchangeOrderId = v;
-                    case 3 -> productId = (int) v;
-                    case 4 -> status = (int) v;
-                    case 5 -> leaves = v;
-                    case 6 -> filled = v;
-                    case 8 -> fillTs = v;
+                final long value = readVarint(buf);
+                switch (fieldNumber) {
+                    case 1 -> clientOrderId = value;
+                    case 2 -> exchangeOrderId = value;
+                    case 3 -> productId = (int) value;
+                    case 4 -> status = (int) value;
+                    case 5 -> leaves = value;
+                    case 6 -> filled = value;
+                    case 8 -> fillTs = value;
                     default -> { }
                 }
             }
         }
 
-        private void parseFill(ByteBuffer b, int start, int end) {
-            b.position(start);
+        private void parseFill(ByteBuffer buf, int start, int end) {
+            buf.position(start);
             hasFill = true;
-            while (b.position() < end) {
-                final long tag = readVarint(b);
-                final int field = (int) (tag >>> 3);
-                final int wt = (int) (tag & 7);
-                if (wt != WT_VARINT) {
-                    skip(b, wt);
+            while (buf.position() < end) {
+                final long tag = readVarint(buf);
+                final int fieldNumber = (int) (tag >>> 3);
+                final int wireType = (int) (tag & 7);
+                if (wireType != WT_VARINT) {
+                    skip(buf, wireType);
                     continue;
                 }
-                final long v = readVarint(b);
-                switch (field) {
-                    case 1 -> fillTradeId = v;
-                    case 3 -> fillMakerOrderId = v;
-                    case 4 -> fillPrice = v;
-                    case 5 -> fillQty = v;
+                final long value = readVarint(buf);
+                switch (fieldNumber) {
+                    case 1 -> fillTradeId = value;
+                    case 3 -> fillMakerOrderId = value;
+                    case 4 -> fillPrice = value;
+                    case 5 -> fillQty = value;
                     default -> { }
                 }
             }
         }
 
-        private void parseBook(ByteBuffer b, int start, int end) {
-            b.position(start);
-            while (b.position() < end) {
-                final long tag = readVarint(b);
-                final int field = (int) (tag >>> 3);
-                final int wt = (int) (tag & 7);
-                if (wt != WT_VARINT) {
-                    skip(b, wt);
+        private void parseTrade(ByteBuffer buf, int start, int end) {
+            buf.position(start);
+            while (buf.position() < end) {
+                final long tag = readVarint(buf);
+                final int fieldNumber = (int) (tag >>> 3);
+                final int wireType = (int) (tag & 7);
+                if (wireType != WT_VARINT) {
+                    skip(buf, wireType);
                     continue;
                 }
-                final long v = readVarint(b);
-                switch (field) {
-                    case 1 -> productId = (int) v;
-                    case 2 -> bookBidPrice = v;
-                    case 3 -> bookBidQty = v;
-                    case 4 -> bookAskPrice = v;
-                    case 5 -> bookAskQty = v;
-                    case 6 -> bookTs = v;
+                final long value = readVarint(buf);
+                switch (fieldNumber) {
+                    case 1 -> tradeId = value;
+                    case 2 -> productId = (int) value;
+                    case 3 -> tradePrice = value;
+                    case 4 -> tradeQty = value;
+                    case 5 -> tradeAggressorSide = (int) value;
+                    case 6 -> tradeTs = value;
+                    default -> { }
+                }
+            }
+        }
+
+        private void parseBook(ByteBuffer buf, int start, int end) {
+            buf.position(start);
+            while (buf.position() < end) {
+                final long tag = readVarint(buf);
+                final int fieldNumber = (int) (tag >>> 3);
+                final int wireType = (int) (tag & 7);
+                if (wireType != WT_VARINT) {
+                    skip(buf, wireType);
+                    continue;
+                }
+                final long value = readVarint(buf);
+                switch (fieldNumber) {
+                    case 1 -> productId = (int) value;
+                    case 2 -> bookBidPrice = value;
+                    case 3 -> bookBidQty = value;
+                    case 4 -> bookAskPrice = value;
+                    case 5 -> bookAskQty = value;
+                    case 6 -> bookTs = value;
                     default -> { }
                 }
             }
         }
     }
 
-    static void skip(ByteBuffer b, int wireType) {
+    /** Advance past a field of the given wire type whose value we do not care about. */
+    static void skip(ByteBuffer buf, int wireType) {
         switch (wireType) {
-            case WT_VARINT -> readVarint(b);
-            case WT_I64 -> b.position(b.position() + 8);
+            case WT_VARINT -> readVarint(buf);
+            case WT_I64 -> buf.position(buf.position() + 8);
             case WT_LEN -> {
-                final int len = (int) readVarint(b);
-                b.position(b.position() + len);
+                final int length = (int) readVarint(buf);
+                buf.position(buf.position() + length);
             }
-            case WT_I32 -> b.position(b.position() + 4);
+            case WT_I32 -> buf.position(buf.position() + 4);
             default -> throw new IllegalArgumentException("bad wire type " + wireType);
         }
     }

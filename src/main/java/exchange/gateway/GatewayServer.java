@@ -113,18 +113,18 @@ public final class GatewayServer implements AutoCloseable {
                         if (key.isAcceptable()) {
                             accept();
                         } else {
-                            final Session s = (Session) key.attachment();
+                            final Session session = (Session) key.attachment();
                             if (key.isReadable()) {
-                                read(s);
+                                read(session);
                             }
                             if (key.isValid() && key.isWritable()) {
-                                flush(s);
+                                flush(session);
                             }
                         }
                     } catch (IOException e) {
                         final Object a = key.attachment();
-                        if (a instanceof Session s) {
-                            closeSession(s);
+                        if (a instanceof Session session) {
+                            closeSession(session);
                         }
                     }
                 }
@@ -136,57 +136,57 @@ public final class GatewayServer implements AutoCloseable {
     }
 
     private void accept() throws IOException {
-        SocketChannel ch;
-        while ((ch = server.accept()) != null) {
-            ch.configureBlocking(false);
-            ch.setOption(StandardSocketOptions.TCP_NODELAY, true);
+        SocketChannel channel;
+        while ((channel = server.accept()) != null) {
+            channel.configureBlocking(false);
+            channel.setOption(StandardSocketOptions.TCP_NODELAY, true);
             if (nextSessionId >= MAX_SESSIONS) {
-                ch.close();
+                channel.close();
                 continue;
             }
-            final int id = nextSessionId++;
-            final Session s = new Session(id, ch);
-            sessions[id] = s;
-            s.key = ch.register(selector, SelectionKey.OP_READ, s);
+            final int sessionId = nextSessionId++;
+            final Session session = new Session(sessionId, channel);
+            sessions[sessionId] = session;
+            session.key = channel.register(selector, SelectionKey.OP_READ, session);
         }
     }
 
-    private void read(Session s) throws IOException {
-        final int n = s.ch.read(s.readBuf);
+    private void read(Session session) throws IOException {
+        final int n = session.channel.read(session.readBuf);
         if (n < 0) {
-            closeSession(s);
+            closeSession(session);
             return;
         }
         if (n == 0) {
             return;
         }
-        s.readBuf.flip();
+        session.readBuf.flip();
         try {
-            while (s.readBuf.remaining() >= 4) {
-                final int len = s.readBuf.getInt();
+            while (session.readBuf.remaining() >= 4) {
+                final int len = session.readBuf.getInt();
                 if (len < 0 || len > MAX_FRAME) {
-                    closeSession(s);
+                    closeSession(session);
                     return;
                 }
-                if (s.readBuf.remaining() < len) {
-                    s.readBuf.position(s.readBuf.position() - 4);
+                if (session.readBuf.remaining() < len) {
+                    session.readBuf.position(session.readBuf.position() - 4);
                     break;
                 }
-                final int payloadStart = s.readBuf.position();
-                final int kind = clientParser.parse(s.readBuf, payloadStart, len);
-                dispatch(s, kind);
+                final int payloadStart = session.readBuf.position();
+                final int kind = clientParser.parse(session.readBuf, payloadStart, len);
+                dispatch(session, kind);
             }
         } finally {
-            s.readBuf.compact();
+            session.readBuf.compact();
         }
     }
 
-    private void dispatch(Session s, int kind) {
+    private void dispatch(Session session, int kind) {
         switch (kind) {
             case FastWire.CK_NEW_ORDER -> {
                 final MutableDirectBuffer b = scratch;
                 int i = 0;
-                b.putInt(i, s.id); i += 4;
+                b.putInt(i, session.sessionId); i += 4;
                 b.putLong(i, clientParser.clientOrderId); i += 8;
                 b.putInt(i, clientParser.productId); i += 4;
                 b.putByte(i, (byte) clientParser.side); i += 1;
@@ -200,7 +200,7 @@ public final class GatewayServer implements AutoCloseable {
             case FastWire.CK_CANCEL -> {
                 final MutableDirectBuffer b = scratch;
                 int i = 0;
-                b.putInt(i, s.id); i += 4;
+                b.putInt(i, session.sessionId); i += 4;
                 b.putInt(i, (int) clientParser.exchangeOrderId); i += 4;
                 b.putLong(i, System.nanoTime()); i += 8;
                 inbound.write(MsgType.CANCEL, b, 0, i);
@@ -222,6 +222,7 @@ public final class GatewayServer implements AutoCloseable {
         switch (msgTypeId) {
             case MsgType.ACK -> onAck(buf, index);
             case MsgType.FILL -> onFill(buf, index);
+            case MsgType.TRADE -> onTrade(buf, index);
             case MsgType.STATUS -> onStatus(buf, index);
             case MsgType.BOOK -> onBook(buf, index);
             default -> { }
@@ -237,11 +238,11 @@ public final class GatewayServer implements AutoCloseable {
         final int reason = buf.getInt(i); i += 4;
         final long recvNs = buf.getLong(i);
 
-        final Session s = sessions[sessionId];
-        if (s == null) {
+        final Session session = sessions[sessionId];
+        if (session == null) {
             return;
         }
-        append(s, serverEncoder.ack(clientOrderId, orderId, reason == 0,
+        append(session, serverEncoder.ack(clientOrderId, orderId, reason == 0,
                 reason == 0 ? "" : exchange.engine.Codes.reasonText(reason), recvNs));
     }
 
@@ -257,11 +258,11 @@ public final class GatewayServer implements AutoCloseable {
         final long tradeId = buf.getLong(i); i += 8;
         final long ts = buf.getLong(i);
 
-        final Session s = sessions[sessionId];
-        if (s == null) {
+        final Session session = sessions[sessionId];
+        if (session == null) {
             return;
         }
-        append(s, serverEncoder.exec(clientOrderId, orderId, productId, exchange.engine.Codes.ST_PARTIAL,
+        append(session, serverEncoder.exec(clientOrderId, orderId, productId, exchange.engine.Codes.ST_PARTIAL,
                 0, qty, true, tradeId, makerOrderId, price, qty, ts));
     }
 
@@ -276,12 +277,24 @@ public final class GatewayServer implements AutoCloseable {
         final long filled = buf.getLong(i); i += 8;
         final long ts = buf.getLong(i);
 
-        final Session s = sessions[sessionId];
-        if (s == null) {
+        final Session session = sessions[sessionId];
+        if (session == null) {
             return;
         }
-        append(s, serverEncoder.exec(clientOrderId, orderId, productId, status,
+        append(session, serverEncoder.exec(clientOrderId, orderId, productId, status,
                 leaves, filled, false, 0, 0, 0, 0, ts));
+    }
+
+    private void onTrade(MutableDirectBuffer buf, int index) {
+        int i = index;
+        final byte aggressorSide = buf.getByte(i); i += 1;
+        final int productId = buf.getInt(i); i += 4;
+        final long price = buf.getLong(i); i += 8;
+        final long qty = buf.getLong(i); i += 8;
+        final long tradeId = buf.getLong(i); i += 8;
+        final long ts = buf.getLong(i);
+
+        broadcast(serverEncoder.trade(tradeId, productId, price, qty, aggressorSide, ts));
     }
 
     private void onBook(MutableDirectBuffer buf, int index) {
@@ -293,20 +306,24 @@ public final class GatewayServer implements AutoCloseable {
         final long askQty = buf.getLong(i); i += 8;
         final long ts = buf.getLong(i);
 
-        final ByteBuffer p = serverEncoder.book(productId, bidPrice, bidQty, askPrice, askQty, ts);
-        for (int id = 1; id < nextSessionId; id++) {
-            final Session s = sessions[id];
-            if (s != null) {
-                append(s, p);
+        broadcast(serverEncoder.book(productId, bidPrice, bidQty, askPrice, askQty, ts));
+    }
+
+    /** Fan a shared (already encoded) payload out to every connected session. */
+    private void broadcast(ByteBuffer payload) {
+        for (int sessionId = 1; sessionId < nextSessionId; sessionId++) {
+            final Session session = sessions[sessionId];
+            if (session != null) {
+                append(session, payload);
             }
         }
     }
 
-    private void append(Session s, ByteBuffer payload) {
+    private void append(Session session, ByteBuffer payload) {
         final int need = 4 + payload.remaining();
-        if (s.out.remaining() < need) {
-            flush(s);
-            if (s.out.remaining() < need) {
+        if (session.out.remaining() < need) {
+            flush(session);
+            if (session.out.remaining() < need) {
                 droppedOutbound++;
                 return;
             }
@@ -314,61 +331,61 @@ public final class GatewayServer implements AutoCloseable {
         // payload may be shared (broadcast), so consume without disturbing its position
         final int start = payload.position();
         final int limit = payload.limit();
-        s.out.putInt(limit - start);
-        s.out.put(payload);
+        session.out.putInt(limit - start);
+        session.out.put(payload);
         payload.position(start);
         payload.limit(limit);
-        if (!s.dirty) {
-            s.dirty = true;
-            dirty.add(s);
+        if (!session.dirty) {
+            session.dirty = true;
+            dirty.add(session);
         }
     }
 
     private void flushDirty() {
         for (int k = 0; k < dirty.size(); k++) {
-            final Session s = dirty.get(k);
-            s.dirty = false;
-            flush(s);
+            final Session session = dirty.get(k);
+            session.dirty = false;
+            flush(session);
         }
         dirty.clear();
     }
 
-    private void flush(Session s) {
-        if (s.out.position() == 0) {
-            clearWriteInterest(s);
+    private void flush(Session session) {
+        if (session.out.position() == 0) {
+            clearWriteInterest(session);
             return;
         }
-        s.out.flip();
+        session.out.flip();
         try {
-            s.ch.write(s.out);
+            session.channel.write(session.out);
         } catch (IOException e) {
-            closeSession(s);
+            closeSession(session);
             return;
         }
-        if (s.out.hasRemaining()) {
-            addWriteInterest(s);
+        if (session.out.hasRemaining()) {
+            addWriteInterest(session);
         } else {
-            clearWriteInterest(s);
+            clearWriteInterest(session);
         }
-        s.out.compact();
+        session.out.compact();
     }
 
-    private void addWriteInterest(Session s) {
-        if (s.key != null && (s.key.interestOps() & SelectionKey.OP_WRITE) == 0) {
-            s.key.interestOps(s.key.interestOps() | SelectionKey.OP_WRITE);
-        }
-    }
-
-    private void clearWriteInterest(Session s) {
-        if (s.key != null && (s.key.interestOps() & SelectionKey.OP_WRITE) != 0) {
-            s.key.interestOps(s.key.interestOps() & ~SelectionKey.OP_WRITE);
+    private void addWriteInterest(Session session) {
+        if (session.key != null && (session.key.interestOps() & SelectionKey.OP_WRITE) == 0) {
+            session.key.interestOps(session.key.interestOps() | SelectionKey.OP_WRITE);
         }
     }
 
-    private void closeSession(Session s) {
-        sessions[s.id] = null;
+    private void clearWriteInterest(Session session) {
+        if (session.key != null && (session.key.interestOps() & SelectionKey.OP_WRITE) != 0) {
+            session.key.interestOps(session.key.interestOps() & ~SelectionKey.OP_WRITE);
+        }
+    }
+
+    private void closeSession(Session session) {
+        sessions[session.sessionId] = null;
         try {
-            s.ch.close();
+            session.channel.close();
         } catch (IOException ignore) {
             // ignore
         }
@@ -396,18 +413,18 @@ public final class GatewayServer implements AutoCloseable {
         }
     }
 
-    /** Per-connection state. */
+    /** Per-connection state: assigned id, the socket, and reusable read/write buffers. */
     private static final class Session {
-        final int id;
-        final SocketChannel ch;
+        final int sessionId;
+        final SocketChannel channel;
         final ByteBuffer readBuf = ByteBuffer.allocate(READ_BUF);
         final ByteBuffer out = ByteBuffer.allocateDirect(OUT_BUF);
         SelectionKey key;
         boolean dirty;
 
-        Session(int id, SocketChannel ch) {
-            this.id = id;
-            this.ch = ch;
+        Session(int sessionId, SocketChannel channel) {
+            this.sessionId = sessionId;
+            this.channel = channel;
         }
     }
 }

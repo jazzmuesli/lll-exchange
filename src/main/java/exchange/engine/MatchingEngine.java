@@ -79,6 +79,8 @@ public final class MatchingEngine {
         final OrderBook book = bookFor(productId);
         final int prevBid = book.bestBidTick();
         final int prevAsk = book.bestAskTick();
+        final long prevBidQty = bidQty(book, prevBid);
+        final long prevAskQty = askQty(book, prevAsk);
 
         // Fill-or-kill needs a liquidity pre-check so it can be all-or-nothing.
         if (tif == Codes.FOK && !hasLiquidity(book, side, type, price, qty)) {
@@ -107,7 +109,7 @@ public final class MatchingEngine {
         }
 
         sink.onStatus(sessionId, clientOrderId, orderId, productId, status, remaining, filled, recvNs);
-        emitBookIfChanged(book, productId, prevBid, prevAsk, recvNs);
+        emitBookIfChanged(book, productId, prevBid, prevBidQty, prevAsk, prevAskQty, recvNs);
         return orderId;
     }
 
@@ -122,10 +124,12 @@ public final class MatchingEngine {
         final OrderBook book = bookFor(productId);
         final int prevBid = book.bestBidTick();
         final int prevAsk = book.bestAskTick();
+        final long prevBidQty = bidQty(book, prevBid);
+        final long prevAskQty = askQty(book, prevAsk);
 
         book.remove(orderId, os);
         sink.onStatus(sessionId, clientOrderId, orderId, productId, Codes.ST_CANCELLED, 0, filled, tsNs);
-        emitBookIfChanged(book, productId, prevBid, prevAsk, tsNs);
+        emitBookIfChanged(book, productId, prevBid, prevBidQty, prevAsk, prevAskQty, tsNs);
         os.release(orderId);
         return true;
     }
@@ -165,6 +169,7 @@ public final class MatchingEngine {
 
             sink.onFill(sessionId, clientOrderId, orderId, makerId, productId,
                     bestPrice, tradeQty, tradeId, tsNs);
+            sink.onTrade(side, productId, bestPrice, tradeQty, tradeId, tsNs);
 
             if (os.qty[makerId] == 0) {
                 book.remove(makerId, os);   // unlink while data still valid
@@ -229,16 +234,59 @@ public final class MatchingEngine {
         return b;
     }
 
-    private void emitBookIfChanged(OrderBook book, int productId, int prevBid, int prevAsk, long tsNs) {
+    private long bidQty(OrderBook book, int tick) {
+        return tick < 0 ? 0 : book.qtyAt(tick, Codes.BUY, os);
+    }
+
+    private long askQty(OrderBook book, int tick) {
+        return tick < 0 ? 0 : book.qtyAt(tick, Codes.SELL, os);
+    }
+
+    // ------------------------------------------------------------- market data
+
+    /** Best bid price for a product, or 0 when there is none. */
+    public long bestBidPrice(int productId) {
+        final OrderBook b = books[productId];
+        if (b == null) {
+            return 0;
+        }
+        final int t = b.bestBidTick();
+        return t < 0 ? 0 : cfg.priceForTick(t);
+    }
+
+    /** Aggregate quantity resting at the best bid, or 0 when there is none. */
+    public long bestBidQty(int productId) {
+        final OrderBook b = books[productId];
+        return b == null ? 0 : bidQty(b, b.bestBidTick());
+    }
+
+    /** Best ask price for a product, or 0 when there is none. */
+    public long bestAskPrice(int productId) {
+        final OrderBook b = books[productId];
+        if (b == null) {
+            return 0;
+        }
+        final int t = b.bestAskTick();
+        return t < 0 ? 0 : cfg.priceForTick(t);
+    }
+
+    /** Aggregate quantity resting at the best ask, or 0 when there is none. */
+    public long bestAskQty(int productId) {
+        final OrderBook b = books[productId];
+        return b == null ? 0 : askQty(b, b.bestAskTick());
+    }
+
+    private void emitBookIfChanged(OrderBook book, int productId, int prevBid, long prevBidQty,
+                                   int prevAsk, long prevAskQty, long tsNs) {
         final int bid = book.bestBidTick();
         final int ask = book.bestAskTick();
-        if (bid == prevBid && ask == prevAsk) {
+        final long bidQty = bidQty(book, bid);
+        final long askQty = askQty(book, ask);
+        if (bid == prevBid && ask == prevAsk && bidQty == prevBidQty && askQty == prevAskQty) {
             return;
         }
         final long bidPrice = bid < 0 ? 0 : cfg.priceForTick(bid);
         final long askPrice = ask < 0 ? 0 : cfg.priceForTick(ask);
-        final long bidQty = bid < 0 ? 0 : book.qtyAt(bid, Codes.BUY, os);
-        final long askQty = ask < 0 ? 0 : book.qtyAt(ask, Codes.SELL, os);
         sink.onBook(productId, bidPrice, bidQty, askPrice, askQty, tsNs);
     }
 }

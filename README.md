@@ -16,8 +16,9 @@ best-practice measurement.
 ```bash
 cd /home/preich/hgit/lowlat
 source tools/env.sh          # puts local Java 27 + Maven on PATH
-mvn -B test                  # build + run the acceptance tests
+mvn -B test                  # build + run the 31 acceptance tests
 mvn -B package               # build the shaded, runnable jar
+tools/run.sh demo            # watch a realistic session: the trade TAPE + BOOK, live
 ```
 
 Everything is installed **locally under `$HOME`** — no root/sudo required.
@@ -110,8 +111,9 @@ off-tick / out-of-range rejections, monotonic trade ids.
   `ManyToOneRingBuffer`; egress via an SPSC `OneToOneRingBuffer`; the gateway encodes on its own
   thread.
 
-**Acceptance tests**: `exchange.wire.FastWireRoundTripTest` (6) and
-`exchange.gateway.GatewayIntegrationTest` (3, real sockets end-to-end).
+**Acceptance tests**: `exchange.wire.FastWireRoundTripTest` (6), `exchange.gateway.GatewayIntegrationTest`
+(3, real sockets end-to-end) and `exchange.gateway.MarketDataIntegrationTest` (2, public tape + book
+broadcast — see Step 9).
 
 ## Step 4 — Load generator (done)
 
@@ -170,10 +172,11 @@ rejection of a non-journal file.
 
 ### End-to-end over TCP
 
-* Sustained ~**198k orders/s** at target, peak ~**410k orders/s** (engine ~480k/s) with
+* True round-trip latency, **inflight = 1** (no client pipelining): **p50 ≈ 19 µs**, p90 ≈ 30 µs,
+  p99 ≈ 97 µs. Dominated by syscalls + thread hand-off, not the matcher (whose p50 is tens of ns).
+* At **inflight = 16** (low, but allows a little pipelining): p50 ≈ 33 µs.
+* Throughput: sustained ~**200k orders/s** at target; peak engine-side ~**500k orders/s** with
   8 connections / inflight 2048 (FastWire codec).
-* True round-trip latency (inflight = 1): **p50 ≈ 16 µs**, p99 ≈ 110 µs. This is dominated by
-  syscalls + thread hand-off, not the matcher (whose p50 is tens of ns).
 
 > Latency must be measured with **low** inflight (1–16). High inflight (≥256) inflates numbers
 > with client-side pipelining delay and is only valid for *throughput*.
@@ -198,6 +201,7 @@ p50 is ~16 µs — the gap is syscall/thread-handoff bound.
 java -jar target/lowlat-exchange.jar engine  [--port 9001] [--products 1024] [--orders N] [--journal path]
 java -jar target/lowlat-exchange.jar loadgen [--host 127.0.0.1 --port 9001 --conns 4 --rate 200000 --duration 10000 --inflight 16]
 java -jar target/lowlat-exchange.jar bench   [--ops 20000000 --warmup 5000000 --scenario mixed]
+java -jar target/lowlat-exchange.jar demo
 java -jar target/lowlat-exchange.jar journal-dump <path>
 ```
 
@@ -231,6 +235,87 @@ Overrides without editing files:
 -Dlogback.configurationFile=/path/to/logback.xml
 ```
 
+## Step 9 — Public market data tape & realistic tests (done, tested)
+
+The `Trade` message existed in the `.proto` but was never emitted. It is now a first-class part of
+the wire, so a **market-data subscriber can literally see the matched price**.
+
+* `Sink.onTrade(...)` — an anonymous **public tape** print, emitted once per match (price + qty +
+  aggressor side), separate from the per-participant `onFill`.
+* `FastWire.KIND_TRADE` + `ServerEncoder.trade(...)` / `ServerParser` — protobuf-wire-compatible
+  `ServerMessage.trade` (field 3), so the public tape rides the same framed codec.
+* `GatewayServer` **broadcasts** each `Trade` to every connected session, alongside `BookUpdate`.
+* **Book-update fix**: updates are now emitted when best price **or size** changes (previously only
+  on a price change, so size-only changes were silently dropped).
+* `MatchingEngine` gained top-of-book accessors (`bestBidPrice/Qty`, `bestAskPrice/Qty`) used by the
+  tests and the demo.
+
+### New tests (7), all green — 31 total
+
+| test | what it proves |
+|---|---|
+| `MatchingEngineTest` (11) | order types, TIF, negative prices, priority |
+| `DifferentialMarketTest` (3) | the optimised engine matches a **naive textbook reference** exactly, trade-for-trade and on the final book, over **60k randomized orders** (wide/tight/choppy books) |
+| `MarketScenarioTest` (2) | a whole mini-session: prints at the resting price, cancels, book never crossed, trade ids monotonic, quantity conserved |
+| `MarketDataIntegrationTest` (2) | over real TCP: a **passive subscriber** sees the book and the tape print at the matched price; a market sweep prints a rising ladder of prices |
+| `FastWireRoundTripTest` (6) | protobuf-java byte compatibility |
+| `GatewayIntegrationTest` (3) | end-to-end order → ack → fill over sockets |
+| `TradeJournalTest` (4) | journal write/replay/growth/reopen |
+
+### See it yourself
+
+```bash
+tools/run.sh demo    # replays a scripted session and logs the TAPE and BOOK live
+```
+
+```
+ORDER  DE 15:00-15:15 (#1)  SELL 2.5 MW @ 50.10
+BOOK   DE 15:00-15:15 (#1)  bid   -   x 0.0   |   ask 50.10 x 2.5
+ORDER  DE 15:00-15:15 (#1)  BUY  1.0 MW @ 50.10
+TAPE   DE 15:00-15:15 (#1)  50.10 EUR/MWh x 1.0 MW   (buy aggressor)
+```
+
+### Is it plausible / realistic?
+
+**What is faithful to a real continuous intraday market (EPEX/EEX-style):** continuous
+price–time priority, trades printing at the **resting** order's price ("regular matching"),
+limit/market orders, GTC/IOC/FOK, cancel, negative prices, a single-threaded deterministic matcher,
+and an anonymous public tape + top-of-book broadcast to all participants.
+
+**What is simplified or missing — be honest about it:**
+
+* **Only the aggressor is notified of a fill.** A real exchange sends an execution report to *both*
+  counterparties; here the maker's fill is only visible on the tape. (Biggest realism gap.)
+* Book data is **top-of-book only**, emitted once per command (a multi-level sweep broadcasts only
+  the final book, not each intermediate level).
+* No order **amend**, no **self-trade prevention**, no trading **halts/circuit breakers**, no
+  delivery-period / market-coupling (XBID) semantics, no per-session **risk limits/fees**.
+* Persistence is append-only; **crash-recovery replay into the book** is not wired up yet.
+* Single process, in-memory; the transport is loopback NIO, not kernel-bypass.
+
+**Latency realism:** the matcher itself does tens of nanoseconds per order in memory (that is the
+"nanosecond reaction"), and a single core can do ~8–17 M orders/s. Real-network round trips are
+~19 µs p50 here, entirely limited by syscalls/thread hand-off on a shared host — not by the engine.
+On a tuned box (isolation, busy-poll, kernel bypass) single-digit-µs is the realistic target;
+millisecond tails observed here are OS scheduling on a shared machine, not the matcher.
+
+## Code conventions (readability on the hot path)
+
+Being fast and being readable are not in conflict here, so the code follows a few rules:
+
+* **No cryptic abbreviations in public/event APIs.** Hot-path parameters carry their meaning and
+  unit: `price`, `qty`, `tradeId`, `tsNs`, `leavesQty`, `aggressorSide`, `makerOrderId` — never
+  `p`, `q`, `t`, `s`. (`tsNs`/`recvNs` are suffixed `Ns` for nanosecond timestamps.)
+* **Every egress method documents its contract** (see `exchange.engine.Sink`): that it runs on the
+  matching thread, must not allocate or block, and what each field means — including that prices are
+  fixed-point `long`s in 0.01 EUR/MWh and quantities in 0.1 MW.
+* **Wire codec internals name the protobuf concepts** they mirror
+  (`buf`, `offset`, `length`, `fieldNumber`, `wireType`, `value`), so the hand-rolled codec reads
+  like the spec it implements.
+* **Performance choices are commented where they are made** (e.g. the reusable scratch buffer and
+  fixed native-endian layout in `RingSink`, why the trade tape is not double-journaled in
+  `JournalingSink`, why the matcher never reads the clock).
+
 ---
 
 ## How to restart from scratch (current, all green)
@@ -238,10 +323,11 @@ Overrides without editing files:
 ```bash
 cd /home/preich/hgit/lowlat
 source tools/env.sh
-mvn -B test          # 24 acceptance tests: engine 11, wire 6, gateway 3, journal 4
+mvn -B test          # 31 acceptance tests: engine 11 + 2 + 3, wire 6, gateway 3 + 2, journal 4
 mvn -B package       # shaded runnable jar at target/lowlat-exchange.jar
 
 tools/run.sh bench --ops 20000000 --scenario mixed
+tools/run.sh demo
 tools/run.sh engine --port 9001 --journal /tmp/opencode/journal &
 tools/run.sh loadgen --port 9001 --conns 4 --rate 200000 --duration 10000 --inflight 16
 tools/run.sh journal-dump /tmp/opencode/journal
@@ -249,6 +335,9 @@ tools/run.sh journal-dump /tmp/opencode/journal
 
 ## Known issues / limitations
 
+* **Realism gaps (see Step 9):** only the aggressor gets an execution report (the maker's fill is
+  only on the tape); book data is top-of-book and emitted once per command; no amend, self-trade
+  prevention, halts, session risk limits, or delivery-period/market-coupling semantics.
 * **Chronicle Queue cannot mmap on JDK 27** (see Step 5) — replaced by the FFM journal.
 * No CPU pinning / `isolcpus` (no root), so tail latency includes OS-scheduling noise.
 * Journal growth (`append` when full) remaps the file and can stall the caller briefly; size the
@@ -258,8 +347,11 @@ tools/run.sh journal-dump /tmp/opencode/journal
 
 ## Roadmap (future)
 
-* k6 smoke script as a secondary load test; JMH harness for the kernel.
+* Maker-side execution reports (notify both counterparties of a fill).
+* Per-fill book updates and a depth (N-level) market-data feed.
 * Crash-recovery book rebuild by replaying `TradeJournal` into a fresh `MatchingEngine`.
+* Order amend/cancel-replace and self-trade prevention.
+* k6 smoke script as a secondary load test; JMH harness for the kernel.
 * Optional CPU-affinity launcher and an `isolcpus` note for bare-metal tails.
 * Aeron (real transport) instead of the in-process NIO gateway for multi-host fan-out.
 

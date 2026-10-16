@@ -16,4 +16,5 @@ public final class MsgType {
     public static final int FILL = 102;
     public static final int STATUS = 103;
     public static final int BOOK = 104;
+    public static final int TRADE = 105;
 }
