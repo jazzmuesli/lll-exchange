@@ -169,6 +169,17 @@ public final class MatchingEngine {
 
             sink.onFill(sessionId, clientOrderId, orderId, makerId, productId,
                     bestPrice, tradeQty, tradeId, tsNs);
+            // Mirror leg: tell the resting order's owner about its own fill, so a maker does not have
+            // to infer it from the anonymous public tape. The maker also gets an explicit status so
+            // clients can retire the resting order without waiting for the tape.
+            final int makerSession = os.sessionId[makerId];
+            final long makerClientId = os.clientOrderId[makerId];
+            sink.onMakerFill(makerSession, makerClientId, makerId, orderId, productId,
+                    bestPrice, tradeQty, tradeId, tsNs);
+            final byte makerStatus = os.qty[makerId] == 0 ? Codes.ST_FILLED : Codes.ST_PARTIAL;
+            final long makerFilled = os.origQty[makerId] - os.qty[makerId];
+            sink.onStatus(makerSession, makerClientId, makerId, productId, makerStatus,
+                    os.qty[makerId], makerFilled, tsNs);
             sink.onTrade(side, productId, bestPrice, tradeQty, tradeId, tsNs);
 
             if (os.qty[makerId] == 0) {

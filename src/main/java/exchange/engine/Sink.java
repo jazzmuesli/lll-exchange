@@ -91,6 +91,33 @@ public interface Sink {
                 long price, long qty, long tradeId, long tsNs);
 
     /**
+     * The <b>mirror</b> of {@link #onFill}, routed to the <b>resting ("maker")</b> order's owner:
+     * the private notification that one of its resting orders was hit.
+     *
+     * <p>Emitted exactly once per execution, immediately after the aggressor's {@link #onFill}. The
+     * two legs carry the <i>same</i> {@code price}, {@code qty}, {@code tradeId} and {@code tsNs}, but
+     * the order identities are swapped: here {@code orderId} is the maker's order and
+     * {@code makerOrderId} is the aggressor's. Without this leg a maker would only learn of a fill
+     * from the anonymous public {@link #onTrade} print, which carries no order identity.
+     *
+     * <p>Defaulted to a no-op so a sink that only cares about one side (e.g. a throughput
+     * benchmark) need not implement it.
+     *
+     * @param sessionId     maker's gateway session
+     * @param clientOrderId maker's caller-assigned order id
+     * @param orderId       maker's exchange-assigned order id (the resting order)
+     * @param makerOrderId  exchange-assigned id of the <b>aggressor</b> that hit it
+     * @param productId     contract that traded
+     * @param price         execution price in 0.01 EUR/MWh (the maker's resting price)
+     * @param qty           executed quantity in 0.1 MW
+     * @param tradeId       unique, monotonically increasing id for this print, shared with
+     *                      {@link #onTrade}
+     * @param tsNs          monotonic nanoseconds at which the match occurred
+     */
+    default void onMakerFill(int sessionId, long clientOrderId, int orderId, int makerOrderId,
+                             int productId, long price, long qty, long tradeId, long tsNs) {}
+
+    /**
      * A <b>public</b> tape print: emitted once per match, independent of which participant(s) are
      * notified. Unlike {@link #onFill} it is anonymous (no session or order identity), so a gateway
      * can broadcast it to every connected market-data subscriber as the trade tape.

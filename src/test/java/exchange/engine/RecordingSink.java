@@ -11,12 +11,15 @@ import java.util.List;
 final class RecordingSink implements Sink {
     record Ack(long clientOrderId, int orderId, int reason) {}
     record Fill(int orderId, int makerOrderId, long price, long qty, long tradeId) {}
+    record MakerFill(int orderId, int makerOrderId, long price, long qty, long tradeId) {}
     record Trade(int productId, long price, long qty, long tradeId, byte aggressorSide) {}
     record Status(int orderId, byte status, long leaves, long filled) {}
     record Book(long bid, long bidQty, long ask, long askQty) {}
 
     final List<Ack> acks = new ArrayList<>();
     final List<Fill> fills = new ArrayList<>();
+    /** The private mirror legs routed to the resting (maker) side. */
+    final List<MakerFill> makerFills = new ArrayList<>();
     final List<Trade> trades = new ArrayList<>();
     final List<Status> statuses = new ArrayList<>();
     final List<Book> books = new ArrayList<>();
@@ -31,6 +34,12 @@ final class RecordingSink implements Sink {
     public void onFill(int sessionId, long clientOrderId, int orderId, int makerOrderId,
                        int productId, long price, long qty, long tradeId, long tsNs) {
         fills.add(new Fill(orderId, makerOrderId, price, qty, tradeId));
+    }
+
+    @Override
+    public void onMakerFill(int sessionId, long clientOrderId, int orderId, int makerOrderId,
+                            int productId, long price, long qty, long tradeId, long tsNs) {
+        makerFills.add(new MakerFill(orderId, makerOrderId, price, qty, tradeId));
     }
 
     @Override

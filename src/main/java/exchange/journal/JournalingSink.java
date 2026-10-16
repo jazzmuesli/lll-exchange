@@ -54,6 +54,15 @@ public final class JournalingSink implements Sink {
     }
 
     @Override
+    public void onMakerFill(int sessionId, long clientOrderId, int orderId, int makerOrderId,
+                            int productId, long price, long qty, long tradeId, long tsNs) {
+        // Not journaled separately: the maker leg is the exact mirror of the aggressor leg recorded
+        // in onFill (same tradeId), so it is fully derivable on replay.
+        delegate.onMakerFill(sessionId, clientOrderId, orderId, makerOrderId, productId,
+                price, qty, tradeId, tsNs);
+    }
+
+    @Override
     public void onTrade(byte aggressorSide, int productId, long price, long qty, long tradeId, long tsNs) {
         // Not journaled: the tape is derivable from the fills recorded in onFill (see class doc).
         delegate.onTrade(aggressorSide, productId, price, qty, tradeId, tsNs);

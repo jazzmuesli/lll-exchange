@@ -72,6 +72,30 @@ class MatchingEngineTest {
     }
 
     @Test
+    @DisplayName("A resting order's owner gets its own private fill (maker leg)")
+    void makerReceivesItsOwnFill() {
+        // The maker rests a sell on session 7; an aggressor on session 9 lifts part of it.
+        final int maker = engine.submit(7, 1, P, SELL, LIMIT, GTC, eur(50.00), mw(10), System.nanoTime());
+        final int taker = engine.submit(9, 2, P, BUY, LIMIT, GTC, eur(55.00), mw(4), System.nanoTime());
+
+        assertEquals(1, sink.makerFills.size(), "resting owner sees exactly one private fill");
+        RecordingSink.MakerFill mf = sink.makerFills.get(0);
+        assertEquals(maker, mf.orderId(), "maker leg identifies the resting order");
+        assertEquals(taker, mf.makerOrderId(), "maker leg names the aggressor as counterparty");
+        assertEquals(eur(50.00), mf.price(), "maker fills at its own resting price");
+        assertEquals(mw(4), mf.qty());
+
+        // The aggressor still gets exactly one fill leg, and the maker its own partial status.
+        assertEquals(1, sink.fills.size());
+        assertTrue(
+                sink.statuses.stream()
+                        .anyMatch(s -> s.orderId() == maker
+                                && s.status() == ST_PARTIAL
+                                && s.leaves() == mw(6)),
+                "maker gets its own PARTIAL status for the 6 lots still working");
+    }
+
+    @Test
     @DisplayName("Remainder rests in the book; later order matches it")
     void partialFillAndRest() {
         submit(1, SELL, LIMIT, GTC, 50.00, 10);     // rests

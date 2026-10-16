@@ -105,6 +105,14 @@ public final class RingSink implements Sink {
     }
 
     @Override
+    public void onMakerFill(int sessionId, long clientOrderId, int orderId, int makerOrderId,
+                            int productId, long price, long qty, long tradeId, long tsNs) {
+        // Mirror of FILL, routed to the maker's session. Same record layout; the gateway routes by
+        // sessionId and encodes the same ExecReport, so no new ring type is needed.
+        onFill(sessionId, clientOrderId, orderId, makerOrderId, productId, price, qty, tradeId, tsNs);
+    }
+
+    @Override
     public void onTrade(byte aggressorSide, int productId, long price, long qty, long tradeId, long tsNs) {
         // TRADE layout (public tape, broadcast to every session). Note: no session/order identity.
         final UnsafeBuffer b = scratch;
