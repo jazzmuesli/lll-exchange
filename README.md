@@ -289,7 +289,7 @@ the wire, so a **market-data subscriber can literally see the matched price**.
 * `MatchingEngine` gained top-of-book accessors (`bestBidPrice/Qty`, `bestAskPrice/Qty`) used by the
   tests and the demo.
 
-### Tests — 35 total, all green
+### Tests — 49 total, all green
 
 | test | what it proves |
 |---|---|
@@ -357,6 +357,38 @@ Being fast and being readable are not in conflict here, so the code follows a fe
   fixed native-endian layout in `RingSink`, why the trade tape is not double-journaled in
   `JournalingSink`, why the matcher never reads the clock).
 
+## Step 10 — Observability / actuator endpoints (done, tested)
+
+A lightweight, dependency-free management ("actuator") layer, mirroring Spring Boot Actuator
+semantics without importing the framework, because Spring would drag a DI container into the
+process whose entire point is a nanosecond-sensitive matching thread.
+
+* `exchange.metrics.Metrics` — registry of typed handles (`Counter`, `Latency`, `RateMeter`,
+  `VwapWindow`) so the hot path never hits a map lookup.
+* `exchange.metrics.MetricsSink` — a `Sink` decorator that derives business/market numbers from
+  the engine's event stream (orders accepted/rejected, fills, trades, order status, book updates,
+  VWAP).
+* `exchange.metrics.VwapWindow` — per-product rolling VWAP over a configurable trailing window
+  (default 5 minutes / 300 seconds), one bucket per second, with high/low/last price.
+* `exchange.metrics.ManagementServer` — JDK `com.sun.net.httpserver.HttpServer` (no external
+  HTTP dependency) exposing endpoints:
+  `/actuator/health`, `/actuator/metrics`, `/actuator/metrics/{name}` (Spring-style measurements),
+  `/actuator/latency`, `/actuator/orders`, `/actuator/trades`, `/actuator/vwap?product=&window=`,
+  `/actuator/books`, `/actuator/throughput`, `/actuator/jvm`, `/actuator/prometheus`.
+* Metrics are recorded on the matching/gateway threads (additive, never blocking); the management
+  thread only reads them, so scraping cannot perturb the hot path.
+
+**Measured under sustained ~160k orders/s load (loadgen, 5 s):**
+* `/actuator/latency`: `order.latency` p50 ≈ 3.2 µs, p99 ≈ 19 µs, p99.9 ≈ 278 µs, max ≈ 32 ms
+  (the tail is host-load scheduling, not the matcher).
+* `/actuator/orders`: 792k submitted, 792k accepted, 0 rejected, 681k fills, ~148k cancelled.
+* `/actuator/trades`: 681k trades, ~2.08 M MW volume, ~104 M EUR notional, VWAP ≈ 49.95 EUR/MWh
+  (matches the 50.00 resting price ladder).
+* `/actuator/throughput`: ~11k trades/s, ~160k orders/s over the 60 s window.
+
+**Tests**: `MetricsSinkTest`, `LatencyTest`, `VwapWindowTest`, `ManagementServerTest` (7).
+Enable with `--metrics-port 9002` (default); disable with `--metrics-port 0`.
+
 ---
 
 ## How to restart from scratch (current, all green)
@@ -364,14 +396,21 @@ Being fast and being readable are not in conflict here, so the code follows a fe
 ```bash
 cd /home/preich/hgit/lowlat
 source tools/env.sh
-mvn -B test          # 35 tests: engine 19 (11+2+3+3 config), wire 6, gateway 6 (3+2+1), journal 4
+mvn -B test          # 49 tests: engine 19, wire 6, gateway 6, journal 4, metrics 4, server 7
 mvn -B package       # shaded runnable jar at target/lowlat-exchange.jar
 
 tools/run.sh bench --ops 20000000 --scenario mixed
 tools/run.sh demo
-tools/run.sh engine --port 9001 --journal /tmp/opencode/journal &
+tools/run.sh engine --port 9001 --metrics-port 9002 --journal /tmp/opencode/journal &
 tools/run.sh loadgen --port 9001 --conns 4 --rate 200000 --duration 10000 --inflight 16
 tools/run.sh journal-dump /tmp/opencode/journal
+
+# Observability
+curl http://127.0.0.1:9002/actuator/health
+curl http://127.0.0.1:9002/actuator/metrics/publish?no=just/send/get
+curl http://127.0.0.1:9002/actuator/latency
+curl http://127.0.0.1:9002/actuator/vwap?product=0&window=300
+curl http://127.0.0.1:9002/actuator/prometheus
 ```
 
 ## Optimisation backlog (low latency)

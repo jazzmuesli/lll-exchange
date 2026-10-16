@@ -307,7 +307,8 @@ public final class ManagementServer implements AutoCloseable {
     }
 
     private String vwapJson(Map<String, String> query) {
-        final int window = parseInt(query.get("window"), metrics.vwap().windowSeconds());
+        final int maxWindow = metrics.vwap().windowSeconds();
+        final int window = Math.min(Math.max(1, parseInt(query.get("window"), maxWindow)), maxWindow);
         final long now = System.nanoTime();
         final Json j = new Json();
         j.beginObject();
