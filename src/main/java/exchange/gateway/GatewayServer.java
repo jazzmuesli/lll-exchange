@@ -1,5 +1,8 @@
 package exchange.gateway;
 
+import exchange.metrics.Counter;
+import exchange.metrics.Metrics;
+import exchange.metrics.RateMeter;
 import exchange.wire.FastWire;
 import exchange.wire.MsgType;
 import java.io.IOException;
@@ -52,6 +55,18 @@ public final class GatewayServer implements AutoCloseable {
     private int nextSessionId = 1;
     private long droppedOutbound;
 
+    // Optional observability handles (null when metrics are disabled): cached so the reactor thread
+    // never looks a name up in the registry map.
+    private final Counter ordersSubmitted;
+    private final Counter cancelsSubmitted;
+    private final Counter connectionsOpened;
+    private final Counter connectionsClosed;
+    private final Counter bytesReadCounter;
+    private final Counter bytesWrittenCounter;
+    private final Counter messagesOut;
+    private final RateMeter bytesReadRate;
+    private final RateMeter bytesWrittenRate;
+
     /**
      * Allocation-free ready-key set, installed over the JDK selector's own sets in {@link #start()}.
      * {@code null} means the install was not possible and the loop uses the standard iterator.
@@ -59,9 +74,41 @@ public final class GatewayServer implements AutoCloseable {
     private SelectedSelectionKeySet fastSelectedKeys;
 
     public GatewayServer(int port, ManyToOneRingBuffer inbound, OneToOneRingBuffer outbound) {
+        this(port, inbound, outbound, null);
+    }
+
+    /**
+     * @param metrics optional observability registry; when non-null the gateway publishes connection,
+     *                byte, and message counters plus session/backlog gauges
+     */
+    public GatewayServer(int port, ManyToOneRingBuffer inbound, OneToOneRingBuffer outbound, Metrics metrics) {
         this.port = port;
         this.inbound = inbound;
         this.outbound = outbound;
+        if (metrics != null) {
+            this.ordersSubmitted = metrics.counter("orders.submitted");
+            this.cancelsSubmitted = metrics.counter("cancels.submitted");
+            this.connectionsOpened = metrics.counter("gateway.connections.opened");
+            this.connectionsClosed = metrics.counter("gateway.connections.closed");
+            this.bytesReadCounter = metrics.counter("gateway.bytes.read");
+            this.bytesWrittenCounter = metrics.counter("gateway.bytes.written");
+            this.messagesOut = metrics.counter("gateway.messages.out");
+            this.bytesReadRate = metrics.rate("gateway.bytes.read.rate", 60);
+            this.bytesWrittenRate = metrics.rate("gateway.bytes.written.rate", 60);
+            metrics.gauge("gateway.sessions.active", this::activeSessions);
+            metrics.gauge("gateway.fast_selector", () -> usingFastSelector() ? 1L : 0L);
+            metrics.gauge("gateway.dropped.outbound", () -> droppedOutbound);
+        } else {
+            this.ordersSubmitted = null;
+            this.cancelsSubmitted = null;
+            this.connectionsOpened = null;
+            this.connectionsClosed = null;
+            this.bytesReadCounter = null;
+            this.bytesWrittenCounter = null;
+            this.messagesOut = null;
+            this.bytesReadRate = null;
+            this.bytesWrittenRate = null;
+        }
     }
 
     public int port() {
@@ -207,7 +254,22 @@ public final class GatewayServer implements AutoCloseable {
             final Session session = new Session(sessionId, channel);
             sessions[sessionId] = session;
             session.key = channel.register(selector, SelectionKey.OP_READ, session);
+            if (connectionsOpened != null) {
+                connectionsOpened.inc();
+            }
         }
+    }
+
+    /** Live connection count, sampled by the management thread. */
+    private long activeSessions() {
+        long live = 0;
+        final int limit = Math.min(nextSessionId, sessions.length);
+        for (int i = 1; i < limit; i++) {
+            if (sessions[i] != null) {
+                live++;
+            }
+        }
+        return live;
     }
 
     private void read(Session session) throws IOException {
@@ -218,6 +280,10 @@ public final class GatewayServer implements AutoCloseable {
         }
         if (n == 0) {
             return;
+        }
+        if (bytesReadCounter != null) {
+            bytesReadCounter.add(n);
+            bytesReadRate.record(n);
         }
         session.readBuf.flip();
         try {
@@ -255,6 +321,9 @@ public final class GatewayServer implements AutoCloseable {
                 b.putLong(i, clientParser.quantity); i += 8;
                 b.putLong(i, System.nanoTime()); i += 8;
                 inbound.write(MsgType.NEW_ORDER, b, 0, i);
+                if (ordersSubmitted != null) {
+                    ordersSubmitted.inc();
+                }
             }
             case FastWire.CK_CANCEL -> {
                 final MutableDirectBuffer b = scratch;
@@ -263,6 +332,9 @@ public final class GatewayServer implements AutoCloseable {
                 b.putInt(i, (int) clientParser.exchangeOrderId); i += 4;
                 b.putLong(i, System.nanoTime()); i += 8;
                 inbound.write(MsgType.CANCEL, b, 0, i);
+                if (cancelsSubmitted != null) {
+                    cancelsSubmitted.inc();
+                }
             }
             default -> { /* heartbeat / ignore */ }
         }
@@ -394,6 +466,9 @@ public final class GatewayServer implements AutoCloseable {
         session.out.put(payload);
         payload.position(start);
         payload.limit(limit);
+        if (messagesOut != null) {
+            messagesOut.inc();
+        }
         if (!session.dirty) {
             session.dirty = true;
             dirty.add(session);
@@ -415,11 +490,16 @@ public final class GatewayServer implements AutoCloseable {
             return;
         }
         session.out.flip();
+        final int written;
         try {
-            session.channel.write(session.out);
+            written = session.channel.write(session.out);
         } catch (IOException e) {
             closeSession(session);
             return;
+        }
+        if (bytesWrittenCounter != null) {
+            bytesWrittenCounter.add(written);
+            bytesWrittenRate.record(written);
         }
         if (session.out.hasRemaining()) {
             addWriteInterest(session);
@@ -447,6 +527,9 @@ public final class GatewayServer implements AutoCloseable {
             session.channel.close();
         } catch (IOException ignore) {
             // ignore
+        }
+        if (connectionsClosed != null) {
+            connectionsClosed.inc();
         }
     }
 

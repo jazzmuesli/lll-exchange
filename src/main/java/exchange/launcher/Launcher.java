@@ -7,7 +7,7 @@ import org.slf4j.LoggerFactory;
  * Single entry point for all runnable roles. The shaded jar's {@code Main-Class} is this class.
  *
  * <pre>
- *   java -jar lowlat-exchange.jar engine  [--port 9001]
+ *   java -jar lowlat-exchange.jar engine  [--port 9001 --metrics-port 9002]
  *   java -jar lowlat-exchange.jar loadgen [--host 127.0.0.1 --port 9001 --conns 4 --rate 200000 ...]
  *   java -jar lowlat-exchange.jar bench
  *   java -jar lowlat-exchange.jar journal-dump &lt;path&gt;

@@ -1,6 +1,11 @@
 package exchange.engine;
 
 import exchange.journal.TradeJournal;
+import exchange.metrics.Counter;
+import exchange.metrics.Latency;
+import exchange.metrics.Metrics;
+import exchange.metrics.MetricsSink;
+import exchange.metrics.RateMeter;
 import exchange.wire.MsgType;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -36,18 +41,34 @@ public final class EngineService implements AutoCloseable {
     private final Thread thread;
     private volatile boolean running;
 
+    // Optional observability handles (null when metrics are disabled). Cached so the matching loop
+    // never does a registry lookup; null-checks are a predictable branch, far cheaper than a map get.
+    private final Latency orderLatency;
+    private final Counter ordersProcessedCounter;
+    private final Counter cancelsProcessedCounter;
+    private final RateMeter ordersRate;
+
     private volatile long ordersProcessed;
     private volatile long cancelsProcessed;
 
     public EngineService(EngineConfig cfg) {
-        this(cfg, DEFAULT_INBOUND, DEFAULT_OUTBOUND, null);
+        this(cfg, DEFAULT_INBOUND, DEFAULT_OUTBOUND, null, null);
     }
 
     public EngineService(EngineConfig cfg, int inboundCapacity, int outboundCapacity) {
-        this(cfg, inboundCapacity, outboundCapacity, null);
+        this(cfg, inboundCapacity, outboundCapacity, null, null);
     }
 
     public EngineService(EngineConfig cfg, int inboundCapacity, int outboundCapacity, String journalPath) {
+        this(cfg, inboundCapacity, outboundCapacity, journalPath, null);
+    }
+
+    /**
+     * @param metrics optional observability registry; when non-null the service wraps its sink in a
+     *                {@link MetricsSink} and measures per-order reaction latency
+     */
+    public EngineService(EngineConfig cfg, int inboundCapacity, int outboundCapacity, String journalPath,
+                         Metrics metrics) {
         this.outbound = new OneToOneRingBuffer(ringBuffer(outboundCapacity));
         this.ringSink = new RingSink(outbound);
         Sink sink = ringSink;
@@ -57,10 +78,23 @@ public final class EngineService implements AutoCloseable {
         } else {
             this.journal = null;
         }
+        // MetricsSink sits closest to the engine so it counts exactly what the matcher emitted.
+        if (metrics != null) {
+            sink = new MetricsSink(metrics, sink);
+        }
         this.engine = new MatchingEngine(cfg, sink);
         this.inbound = new ManyToOneRingBuffer(ringBuffer(inboundCapacity));
         this.thread = new Thread(this::run, "matching-engine");
         this.thread.setDaemon(true);
+
+        this.orderLatency = metrics != null ? metrics.latency("order.latency") : null;
+        this.ordersProcessedCounter = metrics != null ? metrics.counter("orders.processed") : null;
+        this.cancelsProcessedCounter = metrics != null ? metrics.counter("cancels.processed") : null;
+        this.ordersRate = metrics != null ? metrics.rate("orders.rate", 60) : null;
+        if (metrics != null) {
+            metrics.gauge("engine.inbound.pending.bytes", () -> (long) inbound.size());
+            metrics.gauge("engine.outbound.pending.bytes", () -> (long) outbound.size());
+        }
     }
 
     private static UnsafeBuffer ringBuffer(int capacity) {
@@ -132,6 +166,13 @@ public final class EngineService implements AutoCloseable {
                 final long recvNs = buf.getLong(i);
                 engine.submit(sessionId, clientOrderId, productId, side, type, tif, price, qty, recvNs);
                 ordersProcessed++;
+                if (orderLatency != null) {
+                    // Reaction latency as the engine process sees it: queue wait + match + egress
+                    // encode, measured against the gateway receive timestamp carried in the message.
+                    orderLatency.record(System.nanoTime() - recvNs);
+                    ordersProcessedCounter.inc();
+                    ordersRate.record();
+                }
             }
             case MsgType.CANCEL -> {
                 int i = index;
@@ -140,6 +181,9 @@ public final class EngineService implements AutoCloseable {
                 final long tsNs = buf.getLong(i);
                 engine.cancel(sessionId, orderId, tsNs);
                 cancelsProcessed++;
+                if (cancelsProcessedCounter != null) {
+                    cancelsProcessedCounter.inc();
+                }
             }
             default -> { /* ignore unknown */ }
         }
